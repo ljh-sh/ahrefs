@@ -1,0 +1,34 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+        with:
+          token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish the library
+        run: cargo publish -p ahrefs --locked
+
+      - name: Publish the command line client
+        # The client depends on the library, so the registry needs a moment to
+        # pick up the new version before it can be published.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if cargo publish -p ahrefs-cli --locked; then
+              exit 0
+            fi
+            echo "publish failed, retrying in 30s"
+            sleep 30
+          done
+          exit 1

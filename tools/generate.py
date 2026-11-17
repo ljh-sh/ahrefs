@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Generate Rust response models from the vendored Ahrefs OpenAPI spec.
+
+    python3 tools/generate.py
+
+Reads ``openapi/ahrefs-v3.json`` and rewrites ``crates/ahrefs/src/model/``.
+Every field is optional: the API only returns the columns asked for via the
+``select`` parameter, so a response is always a subset of the full schema.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SPEC = ROOT / "openapi" / "ahrefs-v3.json"
+OUT = ROOT / "crates" / "ahrefs" / "src" / "model"
+
+RUST_KEYWORDS = {
+    "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+    "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+    "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await",
+    "abstract", "become", "box", "do", "final", "macro", "override", "priv",
+    "typeof", "unsized", "virtual", "yield", "try",
+}
+
+PRIMITIVES = {
+    "string": "String",
+    "integer": "i64",
+    "number": "f64",
+    "boolean": "bool",
+}
+
+
+def pascal(name: str) -> str:
+    parts = re.split(r"[^0-9A-Za-z]+", name)
+    return "".join(p[:1].upper() + p[1:] for p in parts if p)
+
+
+def snake(name: str) -> str:
+    ident = re.sub(r"[^0-9A-Za-z]+", "_", name)
+    ident = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", ident)
+    ident = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", ident)
+    ident = re.sub(r"_+", "_", ident).strip("_").lower()
+    return ident or "field"
+
+
+def safe_ident(name: str) -> str:
+    ident = snake(name)
+    if not ident or ident[0].isdigit():
+        ident = f"_{ident}"
+    if ident in RUST_KEYWORDS:
+        return f"r#{ident}"
+    return ident
+
+
+class Module:
+    """Collects the struct definitions of one API group."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.used: set[str] = set()
+        self.defs: list[tuple[str, list[tuple[str, str, str]]]] = []
+
+    def reserve(self, name: str) -> str:
+        if name not in self.used:
+            self.used.add(name)
+            return name
+        n = 2
+        while f"{name}{n}" in self.used:
+            n += 1
+        final = f"{name}{n}"
+        self.used.add(final)
+        return final
+
+    def add(self, name: str, fields: list[tuple[str, str, str]]) -> None:
+        self.defs.append((name, fields))
+
+
+def resolve_type(schema: dict, mod: Module, parent: str, hint: str) -> str:
+    """Return the Rust type for a schema, defining nested structs as needed."""
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((k for k in kind if k != "null"), "string")
+
+    if kind == "array":
+        items = schema.get("items") or {}
+        return f"Vec<{resolve_type(items, mod, parent, hint + '_item')}>"
+
+    if kind == "object":
+        props = schema.get("properties") or {}
+        if not props:
+            return "Value"
+        name = mod.reserve(pascal(hint))
+        mod.add(name, build_fields(name, props, mod))
+        return name
+
+    return PRIMITIVES.get(kind, "Value")
+
+
+def build_fields(
+    owner: str, props: dict, mod: Module
+) -> list[tuple[str, str, str]]:
+    fields: list[tuple[str, str, str]] = []
+    for raw_name, schema in props.items():
+        hint = raw_name
+        if raw_name == "type":
+            hint = "type_value"
+        ty = resolve_type(schema, mod, owner, hint)
+        fields.append((safe_ident(raw_name), raw_name, f"Option<{ty}>"))
+    return fields
+
+
+def render_struct(name: str, fields: list[tuple[str, str, str]]) -> str:
+    lines = [
+        "#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]",
+        f"pub struct {name} {{",
+    ]
+    for ident, wire, ty in fields:
+        lines.append(f'    #[serde(default, rename = "{wire}")]')
+        lines.append(f"    pub {ident}: {ty},")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    if not SPEC.exists():
+        print(f"spec not found: {SPEC}", file=sys.stderr)
+        return 1
+
+    spec = json.loads(SPEC.read_text())
+    schemas = spec.get("components", {}).get("schemas", {})
+
+    modules: dict[str, Module] = {}
+    for schema_name, schema in sorted(schemas.items()):
+        if schema_name.endswith(".Error_response"):
+            continue
+        group, _, suffix = schema_name.partition(".")
+        mod = modules.setdefault(group, Module(snake(group)))
+        props = schema.get("properties") or {}
+        env_name = mod.reserve(pascal(suffix) + "Response")
+        mod.add(env_name, build_fields(env_name, props, mod))
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    for stale in OUT.glob("*.rs"):
+        stale.unlink()
+
+    index = [
+        "//! Typed response models for the Ahrefs API v3.",
+        "//!",
+        "//! Generated by `tools/generate.py` from `openapi/ahrefs-v3.json`.",
+        "//! Do not edit by hand; re-run the generator instead.",
+        "",
+    ]
+    for group in sorted(modules):
+        mod = modules[group]
+        body = [
+            "//! Response models for the `{}` API group.".format(group),
+            "",
+            "#![allow(missing_docs)]",
+            "",
+        ]
+        if any("Value" in ty for _, fields in mod.defs for _, _, ty in fields):
+            body += ["use serde_json::Value;", ""]
+        for name, fields in mod.defs:
+            body.append(render_struct(name, fields))
+            body.append("")
+        path = OUT / f"{mod.name}.rs"
+        path.write_text("\n".join(body))
+        index.append("/// Response models for the `{}` API group.".format(group))
+        index.append(f"pub mod {mod.name};")
+
+    (OUT / "mod.rs").write_text("\n".join(index) + "\n")
+    total = sum(len(m.defs) for m in modules.values())
+    print(f"generated {total} structs across {len(modules)} groups")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
