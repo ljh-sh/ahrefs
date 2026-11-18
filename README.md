@@ -5,6 +5,9 @@
 > A command line client and Rust library for the Ahrefs API v3. JSON output,
 > built for shell pipelines and AI agents.
 
+[![crates.io](https://img.shields.io/crates/v/ahrefs.svg)](https://crates.io/crates/ahrefs)
+[![crates.io](https://img.shields.io/crates/v/ahrefs-cli.svg)](https://crates.io/crates/ahrefs-cli)
+
 [English](#english) · [安装](#安装) · [快速开始](#快速开始)
 
 ## 安装
